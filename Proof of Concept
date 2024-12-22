@@ -1,3 +1,23 @@
+"""
+umbrella_rl_sustainable_demo.py
+
+This script demonstrates a reinforcement learning setup where an RL agent
+tries to modify a molecule to reduce toxicity and increase biodegradability
+at every step. 
+- It uses a pre-trained QSAR model for toxicity (in `tox_model.joblib`). 
+- It uses a heuristic function for biodegradability.
+- It employs Stable Baselines3 (PPO) to train the agent.
+
+NOTES:
+1. This is still a simplified demonstration. If you're aiming for 
+   state-of-the-art in molecular design, consider using graph-based
+   techniques, more realistic transformations, or multi-objective RL.
+2. The environment uses naive SMILES concatenation for transformations,
+   which may produce chemically invalid structures in some cases.
+3. The script includes multiple safety checks and prints out a final 
+   trajectory of what the agent did.
+"""
+
 import os
 import gym
 import numpy as np
@@ -11,10 +31,17 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
 
+# -------------------------------------------------------------------------
+# 1. Loading the QSAR Model
+# -------------------------------------------------------------------------
 def load_qsar_model(model_path: str = "tox_model.joblib"):
+    """
+    Attempts to load a pre-trained QSAR model for toxicity from the given path.
+    If the file is missing or unreadable, raises an appropriate error.
+    """
     if not os.path.exists(model_path):
         raise FileNotFoundError(
-            f"Oops! Couldn't find the toxicity model at {model_path}. "
+            f"Couldn't find the toxicity model at {model_path}. "
             "Make sure you have a trained model file!"
         )
     try:
@@ -24,9 +51,17 @@ def load_qsar_model(model_path: str = "tox_model.joblib"):
         raise RuntimeError(f"Something went wrong loading the model: {str(e)}")
 
 
+# -------------------------------------------------------------------------
+# 2. Toxicity and Biodegradability Scores
+# -------------------------------------------------------------------------
 def calculate_toxicity_score(mol, qsar_model) -> float:
+    """
+    Returns a predicted toxicity probability for the given molecule (0 to 1).
+    Assumes qsar_model has a 'predict_proba' method. 
+    If anything goes wrong, defaults to 1.0 (maximally toxic).
+    """
     if mol is None:
-        return 1.0  # If something's wrong with the molecule, assume it's toxic
+        return 1.0  # No molecule => assume it's toxic
 
     try:
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
@@ -35,6 +70,7 @@ def calculate_toxicity_score(mol, qsar_model) -> float:
 
         arr = np.array(list(fp.ToBitString()), dtype=float).reshape(1, -1)
 
+        # We ignore warnings from scikit-learn for predict_proba
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             tox_prob = qsar_model.predict_proba(arr)[0][1]
@@ -42,11 +78,16 @@ def calculate_toxicity_score(mol, qsar_model) -> float:
         return float(np.clip(tox_prob, 0.0, 1.0))
 
     except Exception as e:
-        print(f"Whoops! Something went wrong checking toxicity: {str(e)}")
-        return 1.0  # If in doubt, play it safe
+        print(f"Encountered an error in calculate_toxicity_score: {str(e)}")
+        return 1.0
 
 
 def approximate_biodegradability_score(mol) -> float:
+    """
+    Returns an approximate score for biodegradability, from 0 to 1.
+    This is purely a heuristic that penalizes heavy atoms, ring systems,
+    and halogens. Real applications might use a more sophisticated approach.
+    """
     if mol is None:
         return 0.0
 
@@ -57,12 +98,13 @@ def approximate_biodegradability_score(mol) -> float:
         except:
             num_rings = 0
 
-        num_halogens = sum(1 for atom in mol.GetAtoms() 
-                          if atom.GetSymbol() in ["F", "Cl", "Br", "I"])
+        num_halogens = sum(1 for atom in mol.GetAtoms()
+                           if atom.GetSymbol() in ["F", "Cl", "Br", "I"])
 
         max_heavy_atoms = 50
         normalized_heavy = min(num_heavy_atoms / max_heavy_atoms, 1.0)
 
+        # Basic linear combination for demonstration
         degrade_score = 1.0 - (
             0.4 * normalized_heavy +
             0.3 * min(num_rings / 5, 1.0) +
@@ -72,11 +114,21 @@ def approximate_biodegradability_score(mol) -> float:
         return float(np.clip(degrade_score, 0.0, 1.0))
 
     except Exception as e:
-        print(f"Oops! Error checking biodegradability: {str(e)}")
+        print(f"Error in approximate_biodegradability_score: {str(e)}")
         return 0.0
 
 
+# -------------------------------------------------------------------------
+# 3. The Gym Environment for Molecular Modifications
+# -------------------------------------------------------------------------
 class RealWorldMoleculeEnv(gym.Env):
+    """
+    A custom environment to simulate step-by-step modifications of a molecule.
+    Each step, the agent chooses an action (add ring, add halogen, add hydroxyl,
+    or remove a substituent). The environment then recalculates toxicity and
+    biodegradability, returning them as the observation.
+    The reward is a simplified function: (1 - toxicity) + biodegradability - 0.1
+    """
     def __init__(self,
                  starting_smiles: str = "CCO",
                  max_steps: int = 15,
@@ -84,20 +136,23 @@ class RealWorldMoleculeEnv(gym.Env):
         super(RealWorldMoleculeEnv, self).__init__()
 
         if not isinstance(starting_smiles, str) or not starting_smiles:
-            raise ValueError("Oops! Need a valid starting molecule!")
+            raise ValueError("Need a valid starting molecule SMILES string.")
 
         if not isinstance(max_steps, int) or max_steps < 1:
-            raise ValueError("Need a positive number of steps!")
+            raise ValueError("Number of steps must be a positive integer.")
 
         self.qsar_model = load_qsar_model(qsar_model_path)
         self.starting_mol = Chem.MolFromSmiles(starting_smiles)
         if self.starting_mol is None:
-            raise ValueError("That starting molecule doesn't look right...")
+            raise ValueError("Could not parse the starting SMILES string.")
 
         self.starting_smiles = starting_smiles
         self.max_steps = max_steps
 
+        # Action space: 0,1,2,3 => add_ring, add_halogen, add_hydroxyl, remove_substituent
         self.action_space = gym.spaces.Discrete(4)
+
+        # Observation: [tox_score, biodegradability], each in [0,1]
         self.observation_space = gym.spaces.Box(
             low=0.0, high=1.0, shape=(2,), dtype=np.float32
         )
@@ -107,17 +162,29 @@ class RealWorldMoleculeEnv(gym.Env):
         self.previous_smiles = []
 
     def reset(self) -> np.ndarray:
+        """
+        Resets the environment to its initial state: the starting molecule,
+        step counter at 0, and a fresh observation.
+        """
         self.mol = Chem.MolFromSmiles(self.starting_smiles)
         self.current_step = 0
         self.previous_smiles = [self.starting_smiles]
         return self._get_obs()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        """
+        Executes one environment step based on the chosen action.
+        Returns:
+         - obs: [toxicity, biodegradability]
+         - reward: (1 - toxicity) + biodegradability - 0.1
+         - done: True if we exceed max_steps
+         - info: dictionary with SMILES, step, etc.
+        """
         if not isinstance(action, (int, np.integer)):
-            raise ValueError(f"That's not a valid move: {type(action)}")
+            raise ValueError(f"Action must be an integer, got {type(action)}")
 
         if not 0 <= action < 4:
-            raise ValueError(f"Move number must be 0-3, not {action}")
+            raise ValueError(f"Action must be between 0 and 3, got {action}")
 
         old_smiles = Chem.MolToSmiles(self.mol) if self.mol else ""
 
@@ -127,7 +194,7 @@ class RealWorldMoleculeEnv(gym.Env):
             2: self._add_hydroxyl,
             3: self._remove_substituent
         }
-        action_map[action]()
+        action_map[action]()  # Perform the chosen transformation
 
         self.current_step += 1
         new_smiles = Chem.MolToSmiles(self.mol) if self.mol else ""
@@ -136,7 +203,11 @@ class RealWorldMoleculeEnv(gym.Env):
 
         obs = self._get_obs()
         tox, bio = obs
+
+        # Simple reward: favor lower toxicity, higher biodegradability
         reward = (1 - tox) + bio - 0.1
+
+        # Done if we've reached the max steps
         done = (self.current_step >= self.max_steps)
 
         info = {
@@ -154,6 +225,10 @@ class RealWorldMoleculeEnv(gym.Env):
         return np.array([tox_score, bio_score], dtype=np.float32)
 
     def _update_mol(self, new_smiles: str) -> None:
+        """
+        Helper function that tries to parse new_smiles into a valid RDKit mol.
+        If successful, updates self.mol to this new molecule.
+        """
         if not new_smiles:
             return
 
@@ -162,39 +237,48 @@ class RealWorldMoleculeEnv(gym.Env):
             if candidate is not None:
                 self.mol = candidate
         except Exception as e:
-            print(f"Oops! Couldn't update molecule: {str(e)}")
+            print(f"Error in _update_mol: {str(e)}")
 
     def _add_ring(self) -> None:
-        try:
-            if self.mol is None:
-                return
-            smiles = Chem.MolToSmiles(self.mol)
-            new_smiles = f"{smiles}c1ccccc1"
-            self._update_mol(new_smiles)
-        except Exception as e:
-            print(f"Couldn't add ring: {str(e)}")
+        """
+        Naively appends 'c1ccccc1' to the existing SMILES, 
+        attempting to form a ring structure. In a real scenario, 
+        you'd apply more sophisticated transformations.
+        """
+        if self.mol is None:
+            return
+        smiles = Chem.MolToSmiles(self.mol)
+        new_smiles = f"{smiles}c1ccccc1"
+        self._update_mol(new_smiles)
 
     def _add_halogen(self) -> None:
-        try:
-            if self.mol is None:
-                return
-            smiles = Chem.MolToSmiles(self.mol)
-            new_smiles = f"{smiles}Cl"
-            self._update_mol(new_smiles)
-        except Exception as e:
-            print(f"Couldn't add chlorine: {str(e)}")
+        """
+        Naively appends 'Cl' to the existing SMILES,
+        which is simplistic but serves as a demonstration.
+        """
+        if self.mol is None:
+            return
+        smiles = Chem.MolToSmiles(self.mol)
+        new_smiles = f"{smiles}Cl"
+        self._update_mol(new_smiles)
 
     def _add_hydroxyl(self) -> None:
-        try:
-            if self.mol is None:
-                return
-            smiles = Chem.MolToSmiles(self.mol)
-            new_smiles = f"{smiles}O"
-            self._update_mol(new_smiles)
-        except Exception as e:
-            print(f"Couldn't add OH group: {str(e)}")
+        """
+        Naively appends 'O' to the SMILES, 
+        acting like it's adding an -OH group.
+        """
+        if self.mol is None:
+            return
+        smiles = Chem.MolToSmiles(self.mol)
+        new_smiles = f"{smiles}O"
+        self._update_mol(new_smiles)
 
     def _remove_substituent(self) -> None:
+        """
+        Reverts to the previous SMILES in the self.previous_smiles list.
+        This is a simplistic "undo" mechanism rather than a true 
+        substructure removal. 
+        """
         try:
             if len(self.previous_smiles) > 1:
                 self._update_mol(self.previous_smiles[-2])
@@ -202,12 +286,19 @@ class RealWorldMoleculeEnv(gym.Env):
             else:
                 self._update_mol(self.starting_smiles)
         except Exception as e:
-            print(f"Couldn't undo change: {str(e)}")
+            print(f"Couldn't revert to the previous molecule: {str(e)}")
 
 
-def train_rl_agent(env: RealWorldMoleculeEnv, 
+# -------------------------------------------------------------------------
+# 4. RL Training Function
+# -------------------------------------------------------------------------
+def train_rl_agent(env: RealWorldMoleculeEnv,
                    timesteps: int = 20000,
                    seed: int = 42) -> PPO:
+    """
+    Checks the environment for consistency, then trains a PPO agent 
+    on it for the specified number of timesteps. Returns the trained model.
+    """
     try:
         check_env(env, warn=True)
 
@@ -232,22 +323,30 @@ def train_rl_agent(env: RealWorldMoleculeEnv,
         return model
 
     except Exception as e:
-        raise RuntimeError(f"Training didn't work: {str(e)}")
+        raise RuntimeError(f"Training error: {str(e)}")
 
 
+# -------------------------------------------------------------------------
+# 5. Main Section: Putting It All Together
+# -------------------------------------------------------------------------
 def main():
+    """
+    Creates an environment, trains the RL agent, and tests the result 
+    by iterating through the maximum steps. The final trajectory, 
+    including SMILES and reward, is printed to the console.
+    """
     try:
-        print("🧪 Setting up molecular playground...")
+        print("Setting up the molecular playground...")
         env = RealWorldMoleculeEnv(
             starting_smiles="CCO",
             max_steps=15,
             qsar_model_path="tox_model.joblib"
         )
 
-        print("🤖 Training AI designer...")
+        print("Training the AI-based molecular designer...")
         model = train_rl_agent(env, timesteps=10000)
 
-        print("\n🎮 Testing our trained AI...")
+        print("Testing the trained agent on a single episode...")
         obs = env.reset()
         total_reward = 0.0
         trajectory = []
@@ -268,12 +367,17 @@ def main():
             if done:
                 break
 
-        print(f"Total reward: {total_reward}")
-        print("Trajectory:", trajectory)
+        print(f"Total reward from this run: {total_reward}")
+        print("Full trajectory:")
+        for record in trajectory:
+            print(record)
 
     except Exception as e:
-        print(f"Error running the main function: {str(e)}")
+        print(f"Error in main: {str(e)}")
 
 
+# -------------------------------------------------------------------------
+# 6. Entry Point
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
