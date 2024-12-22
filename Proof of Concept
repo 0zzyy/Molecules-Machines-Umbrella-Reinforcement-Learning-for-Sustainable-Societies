@@ -1,0 +1,279 @@
+import os
+import gym
+import numpy as np
+import pandas as pd  # Remove if not used
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from typing import Tuple, Dict, Any
+import warnings
+from joblib import load
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_checker import check_env
+
+
+def load_qsar_model(model_path: str = "tox_model.joblib"):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Oops! Couldn't find the toxicity model at {model_path}. "
+            "Make sure you have a trained model file!"
+        )
+    try:
+        model = load(model_path)
+        return model
+    except Exception as e:
+        raise RuntimeError(f"Something went wrong loading the model: {str(e)}")
+
+
+def calculate_toxicity_score(mol, qsar_model) -> float:
+    if mol is None:
+        return 1.0  # If something's wrong with the molecule, assume it's toxic
+
+    try:
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+        if fp is None:
+            return 1.0
+
+        arr = np.array(list(fp.ToBitString()), dtype=float).reshape(1, -1)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tox_prob = qsar_model.predict_proba(arr)[0][1]
+
+        return float(np.clip(tox_prob, 0.0, 1.0))
+
+    except Exception as e:
+        print(f"Whoops! Something went wrong checking toxicity: {str(e)}")
+        return 1.0  # If in doubt, play it safe
+
+
+def approximate_biodegradability_score(mol) -> float:
+    if mol is None:
+        return 0.0
+
+    try:
+        num_heavy_atoms = mol.GetNumHeavyAtoms()
+        try:
+            num_rings = Chem.GetSSSR(mol)
+        except:
+            num_rings = 0
+
+        num_halogens = sum(1 for atom in mol.GetAtoms() 
+                          if atom.GetSymbol() in ["F", "Cl", "Br", "I"])
+
+        max_heavy_atoms = 50
+        normalized_heavy = min(num_heavy_atoms / max_heavy_atoms, 1.0)
+
+        degrade_score = 1.0 - (
+            0.4 * normalized_heavy +
+            0.3 * min(num_rings / 5, 1.0) +
+            0.3 * min(num_halogens / 3, 1.0)
+        )
+
+        return float(np.clip(degrade_score, 0.0, 1.0))
+
+    except Exception as e:
+        print(f"Oops! Error checking biodegradability: {str(e)}")
+        return 0.0
+
+
+class RealWorldMoleculeEnv(gym.Env):
+    def __init__(self,
+                 starting_smiles: str = "CCO",
+                 max_steps: int = 15,
+                 qsar_model_path: str = "tox_model.joblib"):
+        super(RealWorldMoleculeEnv, self).__init__()
+
+        if not isinstance(starting_smiles, str) or not starting_smiles:
+            raise ValueError("Oops! Need a valid starting molecule!")
+
+        if not isinstance(max_steps, int) or max_steps < 1:
+            raise ValueError("Need a positive number of steps!")
+
+        self.qsar_model = load_qsar_model(qsar_model_path)
+        self.starting_mol = Chem.MolFromSmiles(starting_smiles)
+        if self.starting_mol is None:
+            raise ValueError("That starting molecule doesn't look right...")
+
+        self.starting_smiles = starting_smiles
+        self.max_steps = max_steps
+
+        self.action_space = gym.spaces.Discrete(4)
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=1.0, shape=(2,), dtype=np.float32
+        )
+
+        self.mol = None
+        self.current_step = 0
+        self.previous_smiles = []
+
+    def reset(self) -> np.ndarray:
+        self.mol = Chem.MolFromSmiles(self.starting_smiles)
+        self.current_step = 0
+        self.previous_smiles = [self.starting_smiles]
+        return self._get_obs()
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict[str, Any]]:
+        if not isinstance(action, (int, np.integer)):
+            raise ValueError(f"That's not a valid move: {type(action)}")
+
+        if not 0 <= action < 4:
+            raise ValueError(f"Move number must be 0-3, not {action}")
+
+        old_smiles = Chem.MolToSmiles(self.mol) if self.mol else ""
+
+        action_map = {
+            0: self._add_ring,
+            1: self._add_halogen,
+            2: self._add_hydroxyl,
+            3: self._remove_substituent
+        }
+        action_map[action]()
+
+        self.current_step += 1
+        new_smiles = Chem.MolToSmiles(self.mol) if self.mol else ""
+        if new_smiles and new_smiles != old_smiles:
+            self.previous_smiles.append(new_smiles)
+
+        obs = self._get_obs()
+        tox, bio = obs
+        reward = (1 - tox) + bio - 0.1
+        done = (self.current_step >= self.max_steps)
+
+        info = {
+            'smiles': new_smiles,
+            'toxicity': tox,
+            'biodegradability': bio,
+            'step': self.current_step
+        }
+
+        return obs, reward, done, info
+
+    def _get_obs(self) -> np.ndarray:
+        tox_score = calculate_toxicity_score(self.mol, self.qsar_model)
+        bio_score = approximate_biodegradability_score(self.mol)
+        return np.array([tox_score, bio_score], dtype=np.float32)
+
+    def _update_mol(self, new_smiles: str) -> None:
+        if not new_smiles:
+            return
+
+        try:
+            candidate = Chem.MolFromSmiles(new_smiles)
+            if candidate is not None:
+                self.mol = candidate
+        except Exception as e:
+            print(f"Oops! Couldn't update molecule: {str(e)}")
+
+    def _add_ring(self) -> None:
+        try:
+            if self.mol is None:
+                return
+            smiles = Chem.MolToSmiles(self.mol)
+            new_smiles = f"{smiles}c1ccccc1"
+            self._update_mol(new_smiles)
+        except Exception as e:
+            print(f"Couldn't add ring: {str(e)}")
+
+    def _add_halogen(self) -> None:
+        try:
+            if self.mol is None:
+                return
+            smiles = Chem.MolToSmiles(self.mol)
+            new_smiles = f"{smiles}Cl"
+            self._update_mol(new_smiles)
+        except Exception as e:
+            print(f"Couldn't add chlorine: {str(e)}")
+
+    def _add_hydroxyl(self) -> None:
+        try:
+            if self.mol is None:
+                return
+            smiles = Chem.MolToSmiles(self.mol)
+            new_smiles = f"{smiles}O"
+            self._update_mol(new_smiles)
+        except Exception as e:
+            print(f"Couldn't add OH group: {str(e)}")
+
+    def _remove_substituent(self) -> None:
+        try:
+            if len(self.previous_smiles) > 1:
+                self._update_mol(self.previous_smiles[-2])
+                self.previous_smiles.pop()
+            else:
+                self._update_mol(self.starting_smiles)
+        except Exception as e:
+            print(f"Couldn't undo change: {str(e)}")
+
+
+def train_rl_agent(env: RealWorldMoleculeEnv, 
+                   timesteps: int = 20000,
+                   seed: int = 42) -> PPO:
+    try:
+        check_env(env, warn=True)
+
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            tensorboard_log="./rl_sustain_tb/",
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,
+            n_epochs=10,
+            gamma=0.99,
+            seed=seed
+        )
+
+        model.learn(
+            total_timesteps=timesteps,
+            progress_bar=True
+        )
+
+        return model
+
+    except Exception as e:
+        raise RuntimeError(f"Training didn't work: {str(e)}")
+
+
+def main():
+    try:
+        print("🧪 Setting up molecular playground...")
+        env = RealWorldMoleculeEnv(
+            starting_smiles="CCO",
+            max_steps=15,
+            qsar_model_path="tox_model.joblib"
+        )
+
+        print("🤖 Training AI designer...")
+        model = train_rl_agent(env, timesteps=10000)
+
+        print("\n🎮 Testing our trained AI...")
+        obs = env.reset()
+        total_reward = 0.0
+        trajectory = []
+
+        for step in range(env.max_steps):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = env.step(action)
+            total_reward += reward
+
+            trajectory.append({
+                'step': step,
+                'smiles': info['smiles'],
+                'toxicity': info['toxicity'],
+                'biodegradability': info['biodegradability'],
+                'reward': reward
+            })
+
+            if done:
+                break
+
+        print(f"Total reward: {total_reward}")
+        print("Trajectory:", trajectory)
+
+    except Exception as e:
+        print(f"Error running the main function: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
