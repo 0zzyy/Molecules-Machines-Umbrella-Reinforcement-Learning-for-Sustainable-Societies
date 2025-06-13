@@ -1,57 +1,10 @@
-"""
-umbrella_rl_demo.py
-
-Demonstrates a conceptual "Umbrella Reinforcement Learning" setup 
-for sustainable molecular design. The environment tracks multiple 
-objectives (toxicity, biodegradability, and equity feasibility) 
-and aggregates them into a single "umbrella reward" so we can 
-train with standard RL (e.g., PPO in Stable Baselines3).
-
-Key Points:
-1. We define an environment (UmbrellaMoleculeEnv) that:
-   - Observes [toxicity, biodegradability, equity/policy feasibility].
-   - Returns partial rewards [R1, R2, R3], which get combined into 
-     an umbrella reward = w1*R1 + w2*R2 + w3*R3.
-2. For truly multi-objective RL, you'd either:
-   - Use a specialized framework that handles vector rewards and 
-     tracks a Pareto front, or
-   - Implement your own approach to avoid collapsing them into a single scalar.
-3. The molecular transformations here are naive (SMILES string concatenation).
-   Real chemistry problems require more robust approaches (graph-based, 
-   reaction templates, etc.).
-"""
-
-"""
- Umbrella Reinforcement Learning for Green Chemistry 
-
-A more robust implementation of multi-objective RL for molecular design
-that considers toxicity, biodegradability, and social equity.
-
-
-"""
-# umbrella_rl_demo.py
-
-"""
-Umbrella Reinforcement Learning for Green Chemistry
-
-A more robust implementation of multi-objective RL for molecular design
-that considers toxicity, biodegradability, and social equity.
-
-Key Improvements:
-- Better error handling
-- Type hints
-- Proper validation
-- Improved documentation
-- Memory management
-- Better reward scaling
-"""
+"""Umbrella RL demo environment for sustainable molecular design."""
 
 import os
 import numpy as np
 import gym
 from gym import spaces
 from rdkit import Chem
-from rdkit.Chem import AllChem
 from typing import Tuple, Dict, Any, Optional
 import warnings
 from stable_baselines3 import PPO
@@ -409,27 +362,3 @@ def run_demo() -> None:
 
 if __name__ == "__main__":
     run_demo()
-
-# Configuration for Umbrella RL Project
-
-environment:
-  starting_smiles: "CCO"
-  max_steps: 10
-  reward_weights: [0.4, 0.4, 0.2]
-
-training:
-  timesteps: 5000
-  seed: 42
-  learning_rate: 3e-4
-  batch_size: 64
-  n_steps: 1024
-  tensorboard_log: "./umbrella_rl_tb/"
-
-numpy>=1.21.0
-gym>=0.17.0
-rdkit>=2020.09.1
-stable-baselines3>=1.0.0
-PyYAML>=5.4.1
-tensorboard>=2.5.0
-
-pip install -r requirements.txt

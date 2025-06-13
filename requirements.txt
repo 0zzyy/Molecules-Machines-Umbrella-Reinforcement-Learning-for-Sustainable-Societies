@@ -1,0 +1,6 @@
+numpy>=1.21.0
+gym>=0.17.0
+rdkit>=2020.09.1
+stable-baselines3>=1.0.0
+PyYAML>=5.4.1
+tensorboard>=2.5.0
