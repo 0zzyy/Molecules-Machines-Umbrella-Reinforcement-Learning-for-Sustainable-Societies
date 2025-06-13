@@ -1,0 +1,14 @@
+# Configuration for Umbrella RL Project
+
+environment:
+  starting_smiles: "CCO"
+  max_steps: 10
+  reward_weights: [0.4, 0.4, 0.2]
+
+training:
+  timesteps: 5000
+  seed: 42
+  learning_rate: 3e-4
+  batch_size: 64
+  n_steps: 1024
+  tensorboard_log: "./umbrella_rl_tb/"
